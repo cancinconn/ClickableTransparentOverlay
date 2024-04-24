@@ -20,6 +20,7 @@
     using Size = System.Drawing.Size;
     using ImGuiNET;
     using System.Collections.Concurrent;
+    using System.Numerics;
 
     /// <summary>
     /// A class to create clickable transparent overlay on windows machine.
@@ -45,6 +46,7 @@
         private Thread renderThread;
         private volatile CancellationTokenSource cancellationTokenSource;
         private volatile bool overlayIsReady;
+        private volatile bool readyForExternalThreadRendering;
 
         private Dictionary<string, (IntPtr Handle, uint Width, uint Height)> loadedTexturesPtrs;
 
@@ -116,7 +118,7 @@
         {
             this.renderThread = new Thread(async () =>
             {
-                await this.InitializeResources();
+                await this.InitializeResources(0, 0, 800, 600);
                 this.ReplaceFontIfRequired();
                 this.renderer.Start();
                 this.RunInfiniteLoop(this.cancellationTokenSource.Token);
@@ -124,6 +126,65 @@
 
             this.renderThread.Start();
             await WaitHelpers.SpinWait(() => this.overlayIsReady);
+        }
+
+        /// <summary>
+        /// Starts the overlay, but with a message pump running on a background thread for input only - no rendering.
+        /// </summary>
+        /// <returns>A Task that finishes once the overlay window is ready</returns>
+        public async Task StartWithoutRenderLoop(int x, int y, int width, int height)
+        {
+            this.renderThread = new Thread(async () =>
+            {
+                await this.InitializeResources(x, y, width, height);
+                this.ReplaceFontIfRequired();
+                this.renderer.Start();
+                this.readyForExternalThreadRendering = true;
+                this.RunInfiniteMessagePumpLoop(this.cancellationTokenSource.Token);
+            });
+
+            this.renderThread.Start();
+            await WaitHelpers.SpinWait(() => this.overlayIsReady);
+            await WaitHelpers.SpinWait(() => this.readyForExternalThreadRendering);
+            stopwatch = Stopwatch.StartNew();
+        }
+
+        public Vector2 OverlayToScreenCoordinate(Vector2 point)
+        {
+            if (window != null)
+            {
+                return new Vector2(this.window.Dimensions.X + point.X, this.window.Dimensions.Y + point.Y);
+            }
+            else
+            {
+                Debug.WriteLine("Window is null, cannot convert coordinate.");
+                return point;
+            }    
+        }
+
+        public Point OverlayToScreenCoordinate(Point point)
+        {
+            var vec = OverlayToScreenCoordinate(new Vector2(point.X, point.Y));
+            return new Point((int)vec.X, (int)vec.Y);
+        }
+
+        public Vector2 ScreenToOverlayCoordinate(Vector2 point)
+        {
+            if (window != null)
+            {
+                return new Vector2(point.X - this.window.Dimensions.X, point.Y - this.window.Dimensions.Y);
+            }
+            else
+            {
+                Debug.WriteLine("Window is null, cannot convert coordinate.");
+                return point;
+            }
+        }
+
+        public Point ScreenToOverlayCoordinate(Point point)
+        {
+            var vec = ScreenToOverlayCoordinate(new Vector2(point.X, point.Y));
+            return new Point((int)vec.X, (int)vec.Y);
         }
 
         /// <summary>
@@ -375,6 +436,55 @@
 
         #endregion
 
+        #region SynchronousRendering
+        private Stopwatch stopwatch;
+        private float deltaTime = 0;
+
+        public float DeltaTime { get { return Math.Max(deltaTime, float.Epsilon); } }
+
+        /// <summary>
+        /// Renders a single frame. Make sure you only run this after StartWithoutRenderLoop() fully initialises the overlay.
+        /// </summary>
+        public void RenderFrame(bool shouldClear = true)
+        {
+            if (!this.readyForExternalThreadRendering)
+            {
+                Debug.WriteLine("Cancelling render as we're not yet ready for rendering from external threads.");
+                return;
+            }
+
+            deltaTime = stopwatch.ElapsedTicks / (float)Stopwatch.Frequency;
+            stopwatch.Restart();
+
+            this.renderer.Update(deltaTime, () => { Render(); });
+            this.deviceContext.OMSetRenderTargets(renderView);
+
+            var clearColor = new Color4(0.0f);
+            if (shouldClear)
+            {
+                this.deviceContext.ClearRenderTargetView(renderView, clearColor);
+            }
+
+            this.renderer.Render();
+
+
+            if (VSync)
+            {
+                this.swapChain.Present(1, PresentFlags.None); // Present with vsync
+            }
+            else
+            {
+                this.swapChain.Present(0, PresentFlags.None); // Present without vsync
+            }
+
+            this.ReplaceFontIfRequired();
+        }
+
+        #endregion
+
+
+
+
         protected virtual void Dispose(bool disposing)
         {
             if (this._disposedValue)
@@ -385,7 +495,7 @@
             if (disposing)
             {
                 this.renderThread?.Join();
-                foreach(var key in this.loadedTexturesPtrs.Keys.ToArray())
+                foreach (var key in this.loadedTexturesPtrs.Keys.ToArray())
                 {
                     this.RemoveImage(key);
                 }
@@ -456,6 +566,15 @@
             }
         }
 
+        private void RunInfiniteMessagePumpLoop(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                this.window.PumpEvents();
+                Utils.SetOverlayClickable(this.window.Handle, this.inputhandler.Update());
+            }
+        }
+
         private void ReplaceFontIfRequired()
         {
             if (this.renderer != null)
@@ -503,7 +622,7 @@
             this.renderer.Resize(width, height);
         }
 
-        private async Task InitializeResources()
+        private async Task InitializeResources(int x, int y, int width, int height)
         {
             D3D11.D3D11CreateDevice(
                 null,
@@ -524,7 +643,7 @@
                 IconHandle = IntPtr.Zero,
                 MenuName = string.Empty,
                 ClassName = this.title,
-                SmallIconHandle= IntPtr.Zero,
+                SmallIconHandle = IntPtr.Zero,
                 ClassExtraBytes = 0,
                 WindowExtraBytes = 0
             };
@@ -536,14 +655,14 @@
 
             this.window = new Win32Window(
                 wndClass.ClassName,
-                800,
-                600,
-                0,
-                0,
+                width,
+                height,
+                x,
+                y,
                 this.title,
                 WindowStyles.WS_POPUP,
                 WindowExStyles.WS_EX_ACCEPTFILES | WindowExStyles.WS_EX_TOPMOST);
-            this.renderer = new ImGuiRenderer(device, deviceContext, 800, 600);
+            this.renderer = new ImGuiRenderer(device, deviceContext, width, height);
             this.inputhandler = new ImGuiInputHandler(this.window.Handle);
             this.overlayIsReady = true;
             await this.PostInitialized();
